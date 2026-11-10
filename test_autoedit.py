@@ -4,7 +4,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-from autoedit import keep_segments, probe_duration, silence_cuts, speech_cuts, srt, subtitles
+from fractions import Fraction
+
+from autoedit import edl, keep_segments, probe_duration, silence_cuts, speech_cuts, srt, subtitles
 
 
 def keeps(silences, duration):
@@ -39,6 +41,14 @@ cues = subtitles(segs, [(10.0, 12.5)])   # 앞 10초가 잘린 영상
 assert cues == [(0.0, 2.0, "오늘은 날씨가 정말 좋습니다"), (2.0, 2.5, "그렇죠")], cues
 assert srt(cues[:1]) == "1\n00:00:00,000 --> 00:00:02,000\n오늘은 날씨가 정말 좋습니다\n\n"
 assert srt([(3661.5, 3662.0, "a")]).splitlines()[1] == "01:01:01,500 --> 01:01:02,000"
+
+# EDL: 프레임 단위 타임코드, 레코드 쪽은 빈틈 없이 이어진다
+assert edl("a.mp4", [(0, 2.2), (3.88, 6.0)], Fraction(30)).splitlines()[3:7] == [
+    "001  AX       AA/V  C        00:00:00:00 00:00:02:06 00:00:00:00 00:00:02:06",
+    "* FROM CLIP NAME: a.mp4", "",
+    "002  AX       AA/V  C        00:00:03:26 00:00:06:00 00:00:02:06 00:00:04:10"]
+# 29.97fps: 3600초 = 107892프레임 = 30 기준 논드롭 00:59:56:12
+assert "00:59:56:12" in edl("a.mp4", [(0, 3600)], Fraction(30000, 1001))
 
 # 전체 흐름: 소리 2초 + 무음 2초 + 소리 2초 -> 약 4.32초
 with tempfile.TemporaryDirectory() as d:

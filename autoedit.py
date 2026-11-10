@@ -3,6 +3,7 @@
 
 사용: python3 autoedit.py 입력.mp4 [-o 출력.mp4] [--noise -35] [--min-silence 0.6]
       python3 autoedit.py 입력.mp4 --speech   # 추임새·반복 발화(NG)도 컷 + 자막(.srt)·전사(.json) 저장
+      python3 autoedit.py 입력.mp4 --edl      # 프리미어·리졸브용 컷 목록(.edl)도 저장
 필요: ffmpeg, ffprobe (PATH). --speech는 추가로 pip install faster-whisper
 """
 import argparse
@@ -11,6 +12,7 @@ import re
 import subprocess
 import sys
 from difflib import SequenceMatcher
+from fractions import Fraction
 from pathlib import Path
 
 FILLERS = {"음", "어", "으음", "어어", "음음"}  # "그", "저"는 지시어와 구분이 안 돼 제외
@@ -122,6 +124,34 @@ def srt(cues):
     return "".join(f"{i}\n{stamp(a)} --> {stamp(b)}\n{text}\n\n" for i, (a, b, text) in enumerate(cues, 1))
 
 
+def probe_fps(path):
+    out = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+               "stream=r_frame_rate", "-of", "csv=p=0", str(path)]).stdout.strip()
+    if not out:
+        sys.exit("--edl에는 영상 트랙이 필요합니다.")
+    return Fraction(out)
+
+
+def edl(clip_name, keeps, fps):
+    """남길 구간을 CMX3600 EDL로 만든다. 편집툴에서 원본 파일에 다시 연결해 쓴다."""
+    # shortcut: 원본 타임코드가 00:00:00:00에서 시작한다고 가정, 드롭 프레임 표기 미지원.
+    # 카메라 원본처럼 시작 타임코드가 있는 파일을 다룰 때 ffprobe의 timecode 태그를 더한다.
+    base = round(fps)
+
+    def tc(f):
+        return f"{f // (base * 3600):02}:{f // (base * 60) % 60:02}:{f // base % 60:02}:{f % base:02}"
+
+    lines, rec, n = [f"TITLE: {clip_name}", "FCM: NON-DROP FRAME", ""], 0, 0
+    for a, b in keeps:
+        fa, fb = round(a * fps), round(b * fps)
+        if fb > fa:
+            n += 1
+            lines += [f"{n:03}  AX       AA/V  C        {tc(fa)} {tc(fb)} {tc(rec)} {tc(rec + fb - fa)}",
+                      f"* FROM CLIP NAME: {clip_name}", ""]
+            rec += fb - fa
+    return "\n".join(lines)
+
+
 def render(src, dst, keeps):
     expr = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in keeps)
     # shortcut: 고정 프레임레이트 가정 + 구간이 수천 개면 명령줄 길이 초과(특히 Windows).
@@ -138,6 +168,7 @@ def main():
     ap.add_argument("--noise", type=float, default=-35, help="무음 기준 dB (기본 -35)")
     ap.add_argument("--min-silence", type=float, default=0.6, help="최소 무음 길이 초 (기본 0.6)")
     ap.add_argument("--speech", action="store_true", help="음성 인식으로 추임새·반복 발화(NG)도 컷")
+    ap.add_argument("--edl", action="store_true", help="편집툴용 컷 목록(CMX3600 .edl)도 저장")
     ap.add_argument("--model", default="small", help="Whisper 모델 (기본 small, 정확도 우선이면 large-v3)")
     a = ap.parse_args()
 
@@ -145,11 +176,13 @@ def main():
         sys.exit(f"입력 파일이 없습니다: {a.input}")
     out = a.output or a.input.with_name(f"{a.input.stem}.cut{a.input.suffix}")
     sidecars = [out.with_suffix(".srt"), out.with_suffix(".json")] if a.speech else []
+    sidecars += [out.with_suffix(".edl")] if a.edl else []
     for f in [out, *sidecars]:  # 원본·기존 결과물을 덮어쓰지 않는다
         if f.exists():
             sys.exit(f"출력 파일이 이미 있습니다: {f}")
 
     duration = probe_duration(a.input)
+    fps = probe_fps(a.input) if a.edl else None
     silences = detect_silences(a.input, a.noise, a.min_silence, duration)
     cuts = silence_cuts(silences, duration)
     spans = keep_segments([(s, e, "") for s, e in silences], duration)  # 무음의 여집합 = 발화 구간
@@ -161,6 +194,8 @@ def main():
         print("잘라낼 구간이 없습니다.")
         return
     render(a.input, out, keeps)
+    if a.edl:
+        out.with_suffix(".edl").write_text(edl(a.input.name, keeps, fps), encoding="utf-8")
     if a.speech:  # 무엇을 왜 잘랐는지 검수할 수 있게 남긴다 (시각은 원본 기준)
         report = {"source": str(a.input), "duration": duration, "segments": segments,
                   "cuts": [{"start": c[0], "end": c[1], "reason": c[2]} for c in sorted(cuts)]}
