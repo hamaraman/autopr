@@ -2,8 +2,10 @@
 """무음 구간을 잘라낸 새 영상을 만든다. 원본은 건드리지 않는다.
 
 사용: python3 autoedit.py 입력.mp4 [-o 출력.mp4] [--noise -35] [--min-silence 0.6]
-      python3 autoedit.py 입력.mp4 --speech   # 추임새·반복 발화(NG)도 컷 + 자막(.srt)·전사(.json) 저장
+      python3 autoedit.py 입력.mp4 --speech   # 추임새·반복 발화(NG)도 컷 + 자막(.srt) 저장
       python3 autoedit.py 입력.mp4 --edl      # 프리미어·리졸브용 컷 목록(.edl)도 저장
+검수: 결과와 함께 나오는 .json의 "cuts"를 고친 뒤 다시 렌더링한다
+      python3 autoedit.py 입력.mp4 --cuts 입력.cut.json -o 최종.mp4
 필요: ffmpeg, ffprobe (PATH). --speech는 추가로 pip install faster-whisper
 """
 import argparse
@@ -152,6 +154,21 @@ def edl(clip_name, keeps, fps):
     return "\n".join(lines)
 
 
+def load_cuts(path, duration):
+    """사람이 고친 .json에서 컷 목록과 전사를 읽는다. 손으로 고친 파일이라 형식을 확인한다."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        cuts = [(float(c["start"]), float(c["end"]), str(c.get("reason", "manual"))) for c in data["cuts"]]
+        segments = data.get("segments", [])
+        [(float(w["start"]), float(w["end"]), w["text"]) for s in segments for w in s["words"]]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        sys.exit(f"컷 파일을 읽을 수 없습니다: {path} ({type(e).__name__}: {e})")
+    for a, b, _ in cuts:
+        if not 0 <= a < b <= duration + 0.01:
+            sys.exit(f"컷 구간이 잘못됐습니다: {a}~{b} (0 <= start < end <= {duration:.2f})")
+    return cuts, segments
+
+
 def render(src, dst, keeps):
     expr = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in keeps)
     # shortcut: 고정 프레임레이트 가정 + 구간이 수천 개면 명령줄 길이 초과(특히 Windows).
@@ -169,38 +186,44 @@ def main():
     ap.add_argument("--min-silence", type=float, default=0.6, help="최소 무음 길이 초 (기본 0.6)")
     ap.add_argument("--speech", action="store_true", help="음성 인식으로 추임새·반복 발화(NG)도 컷")
     ap.add_argument("--edl", action="store_true", help="편집툴용 컷 목록(CMX3600 .edl)도 저장")
+    ap.add_argument("--cuts", type=Path, help="감지 대신 이 .json의 컷 목록으로 렌더링 (검수 후 재적용)")
     ap.add_argument("--model", default="small", help="Whisper 모델 (기본 small, 정확도 우선이면 large-v3)")
     a = ap.parse_args()
 
     if not a.input.is_file():
         sys.exit(f"입력 파일이 없습니다: {a.input}")
+    duration = probe_duration(a.input)
+    loaded = load_cuts(a.cuts, duration) if a.cuts else None
     out = a.output or a.input.with_name(f"{a.input.stem}.cut{a.input.suffix}")
-    sidecars = [out.with_suffix(".srt"), out.with_suffix(".json")] if a.speech else []
-    sidecars += [out.with_suffix(".edl")] if a.edl else []
+    want_srt = a.speech or bool(loaded and loaded[1])
+    sidecars = [out.with_suffix(x) for x, on in ((".json", True), (".srt", want_srt), (".edl", a.edl)) if on]
     for f in [out, *sidecars]:  # 원본·기존 결과물을 덮어쓰지 않는다
         if f.exists():
-            sys.exit(f"출력 파일이 이미 있습니다: {f}")
+            sys.exit(f"출력 파일이 이미 있습니다: {f} (-o로 다른 이름을 지정하세요)")
 
-    duration = probe_duration(a.input)
     fps = probe_fps(a.input) if a.edl else None
-    silences = detect_silences(a.input, a.noise, a.min_silence, duration)
-    cuts = silence_cuts(silences, duration)
-    spans = keep_segments([(s, e, "") for s, e in silences], duration)  # 무음의 여집합 = 발화 구간
-    segments = transcribe(a.input, a.model, spans) if a.speech else []
-    cuts += speech_cuts(segments)
+    if loaded:
+        cuts, segments = loaded
+    else:
+        silences = detect_silences(a.input, a.noise, a.min_silence, duration)
+        cuts = silence_cuts(silences, duration)
+        spans = keep_segments([(s, e, "") for s, e in silences], duration)  # 무음의 여집합 = 발화 구간
+        segments = transcribe(a.input, a.model, spans) if a.speech else []
+        cuts += speech_cuts(segments)
     keeps = keep_segments(cuts, duration)
     kept = sum(b - s for s, b in keeps)
     if duration - kept < 0.01:
         print("잘라낼 구간이 없습니다.")
         return
     render(a.input, out, keeps)
+    # 무엇을 왜 잘랐는지 남긴다 (시각은 원본 기준). 이 파일을 고쳐 --cuts로 다시 렌더링할 수 있다
+    report = {"source": str(a.input), "duration": duration, "segments": segments,
+              "cuts": [{"start": c[0], "end": c[1], "reason": c[2]} for c in sorted(cuts)]}
+    out.with_suffix(".json").write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+    if want_srt:
+        out.with_suffix(".srt").write_text(srt(subtitles(segments, keeps)), encoding="utf-8")
     if a.edl:
         out.with_suffix(".edl").write_text(edl(a.input.name, keeps, fps), encoding="utf-8")
-    if a.speech:  # 무엇을 왜 잘랐는지 검수할 수 있게 남긴다 (시각은 원본 기준)
-        report = {"source": str(a.input), "duration": duration, "segments": segments,
-                  "cuts": [{"start": c[0], "end": c[1], "reason": c[2]} for c in sorted(cuts)]}
-        out.with_suffix(".json").write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
-        out.with_suffix(".srt").write_text(srt(subtitles(segments, keeps)), encoding="utf-8")
     print(f"{out}  {duration:.1f}초 -> {kept:.1f}초 (구간 {len(keeps)}개, {duration - kept:.1f}초 제거)")
 
 

@@ -1,4 +1,5 @@
 """실행: python3 test_autoedit.py  (ffmpeg 필요)"""
+import json
 import subprocess
 import sys
 import tempfile
@@ -63,5 +64,19 @@ with tempfile.TemporaryDirectory() as d:
     assert abs(probe_duration(out) - 4.32) < 0.15, probe_duration(out)
     assert src.read_bytes() == before                      # 원본 불변
     assert subprocess.run(cmd).returncode != 0             # 기존 출력 덮어쓰기 거부
+
+    # 검수 후 재적용: 자동 컷을 버리고 앞 1초만 자르도록 고치면 5초가 된다
+    report = Path(d, "in.cut.json")
+    data = json.loads(report.read_text(encoding="utf-8"))
+    assert [c["reason"] for c in data["cuts"]] == ["silence"]
+    data["cuts"] = [{"start": 0, "end": 1}]
+    report.write_text(json.dumps(data), encoding="utf-8")
+    final = Path(d, "final.mp4")
+    subprocess.run(cmd + ["--cuts", str(report), "-o", str(final)], check=True)
+    assert abs(probe_duration(final) - 5.0) < 0.15, probe_duration(final)
+    data["cuts"] = [{"start": 3, "end": 99}]               # 영상 길이를 넘는 컷은 거부
+    report.write_text(json.dumps(data), encoding="utf-8")
+    assert subprocess.run(cmd + ["--cuts", str(report), "-o", str(Path(d, "bad.mp4"))]).returncode != 0
+    assert not Path(d, "bad.mp4").exists()
 
 print("OK")
