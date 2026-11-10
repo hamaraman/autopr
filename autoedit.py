@@ -2,7 +2,7 @@
 """무음 구간을 잘라낸 새 영상을 만든다. 원본은 건드리지 않는다.
 
 사용: python3 autoedit.py 입력.mp4 [-o 출력.mp4] [--noise -35] [--min-silence 0.6]
-      python3 autoedit.py 입력.mp4 --speech   # 추임새·반복 발화(NG)도 컷 + 전사 JSON 저장
+      python3 autoedit.py 입력.mp4 --speech   # 추임새·반복 발화(NG)도 컷 + 자막(.srt)·전사(.json) 저장
 필요: ffmpeg, ffprobe (PATH). --speech는 추가로 pip install faster-whisper
 """
 import argparse
@@ -98,6 +98,30 @@ def keep_segments(cuts, duration):
     return keeps
 
 
+def subtitles(segments, keeps, max_chars=18):
+    """잘리지 않은 단어만 모아, 컷된 영상의 시각에 맞춘 자막 (시작, 끝, 글) 목록을 만든다."""
+    def remap(t):  # 원본 시각 -> 컷된 영상 시각
+        return sum(min(t, b) - a for a, b in keeps if t > a)
+
+    cues = []
+    for seg in segments:
+        line = []
+        kept = [w for w in seg["words"] if any(a <= (w["start"] + w["end"]) / 2 <= b for a, b in keeps)]
+        for w in kept + [None]:
+            if line and (w is None or len(" ".join(x["text"] for x in line + [w])) > max_chars):
+                cues.append((remap(line[0]["start"]), remap(line[-1]["end"]), " ".join(x["text"] for x in line)))
+                line = []
+            line.append(w)
+    return cues
+
+
+def srt(cues):
+    def stamp(t):
+        ms = round(t * 1000)
+        return f"{ms // 3600000:02}:{ms // 60000 % 60:02}:{ms // 1000 % 60:02},{ms % 1000:03}"
+    return "".join(f"{i}\n{stamp(a)} --> {stamp(b)}\n{text}\n\n" for i, (a, b, text) in enumerate(cues, 1))
+
+
 def render(src, dst, keeps):
     expr = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in keeps)
     # shortcut: 고정 프레임레이트 가정 + 구간이 수천 개면 명령줄 길이 초과(특히 Windows).
@@ -120,8 +144,10 @@ def main():
     if not a.input.is_file():
         sys.exit(f"입력 파일이 없습니다: {a.input}")
     out = a.output or a.input.with_name(f"{a.input.stem}.cut{a.input.suffix}")
-    if out.exists():  # 원본·기존 결과물을 덮어쓰지 않는다
-        sys.exit(f"출력 파일이 이미 있습니다: {out}")
+    sidecars = [out.with_suffix(".srt"), out.with_suffix(".json")] if a.speech else []
+    for f in [out, *sidecars]:  # 원본·기존 결과물을 덮어쓰지 않는다
+        if f.exists():
+            sys.exit(f"출력 파일이 이미 있습니다: {f}")
 
     duration = probe_duration(a.input)
     silences = detect_silences(a.input, a.noise, a.min_silence, duration)
@@ -139,6 +165,7 @@ def main():
         report = {"source": str(a.input), "duration": duration, "segments": segments,
                   "cuts": [{"start": c[0], "end": c[1], "reason": c[2]} for c in sorted(cuts)]}
         out.with_suffix(".json").write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+        out.with_suffix(".srt").write_text(srt(subtitles(segments, keeps)), encoding="utf-8")
     print(f"{out}  {duration:.1f}초 -> {kept:.1f}초 (구간 {len(keeps)}개, {duration - kept:.1f}초 제거)")
 
 
