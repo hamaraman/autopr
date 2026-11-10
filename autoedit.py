@@ -10,9 +10,11 @@
 """
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from difflib import SequenceMatcher
 from fractions import Fraction
 from pathlib import Path
@@ -128,10 +130,11 @@ def srt(cues):
 
 def probe_fps(path):
     out = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-               "stream=r_frame_rate", "-of", "csv=p=0", str(path)]).stdout.strip()
+               "stream=r_frame_rate,avg_frame_rate", "-of", "csv=p=0", str(path)]).stdout.strip()
     if not out:
-        sys.exit("--edl에는 영상 트랙이 필요합니다.")
-    return Fraction(out)
+        sys.exit("영상 트랙이 없습니다.")
+    nominal, average = (Fraction(x) for x in out.split(",")[:2])
+    return nominal if nominal <= 120 else average  # 가변 fps 파일은 명목값이 90000처럼 나오기도 한다
 
 
 def edl(clip_name, keeps, fps):
@@ -169,13 +172,27 @@ def load_cuts(path, duration):
     return cuts, segments
 
 
-def render(src, dst, keeps):
-    expr = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in keeps)
-    # shortcut: 고정 프레임레이트 가정 + 구간이 수천 개면 명령줄 길이 초과(특히 Windows).
-    # 가변 fps 원본이나 2시간 이상 영상을 다룰 때 구간별 분할 렌더링으로 교체.
-    run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-n", "-i", str(src),
-         "-vf", f"select='{expr}',setpts=N/FRAME_RATE/TB",
-         "-af", f"aselect='{expr}',asetpts=N/SR/TB", str(dst)])
+def render(src, dst, keeps, fps):
+    def tree(ks):  # 이진 탐색 식. between을 +로 길게 이으면 최신 ffmpeg가 수백 개에서 거부한다
+        if len(ks) == 1:
+            return f"between(t,{ks[0][0]:.3f},{ks[0][1]:.3f})"
+        mid = len(ks) // 2
+        return f"if(lt(t,{ks[mid][0]:.3f}),{tree(ks[:mid])},{tree(ks[mid:])})"
+
+    expr = tree(keeps)
+    # fps=: 가변 프레임레이트 원본을 고정으로 맞춘다. 안 하면 컷 뒤에 영상과 소리가 어긋난다.
+    graph = (f"[0:v]fps={fps},select='{expr}',setpts=N/FRAME_RATE/TB[v];"
+             f"[0:a]aselect='{expr}',asetpts=N/SR/TB[a]")
+    # 컷이 수천 개면 명령줄 길이 제한을 넘으므로 필터를 파일로 넘긴다. 옵션 이름이 ffmpeg 7에서 바뀌었다.
+    version = re.search(r"ffmpeg version n?(\d+)", run(["ffmpeg", "-version"]).stdout)
+    option = "-filter_complex_script" if version and int(version[1]) < 7 else "-/filter_complex"
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+        f.write(graph)
+    try:
+        run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-n", "-i", str(src),
+             option, f.name, "-map", "[v]", "-map", "[a]", str(dst)])
+    finally:
+        os.unlink(f.name)
 
 
 def main():
@@ -201,7 +218,7 @@ def main():
         if f.exists():
             sys.exit(f"출력 파일이 이미 있습니다: {f} (-o로 다른 이름을 지정하세요)")
 
-    fps = probe_fps(a.input) if a.edl else None
+    fps = probe_fps(a.input)
     if loaded:
         cuts, segments = loaded
     else:
@@ -215,7 +232,7 @@ def main():
     if duration - kept < 0.01:
         print("잘라낼 구간이 없습니다.")
         return
-    render(a.input, out, keeps)
+    render(a.input, out, keeps, fps)
     # 무엇을 왜 잘랐는지 남긴다 (시각은 원본 기준). 이 파일을 고쳐 --cuts로 다시 렌더링할 수 있다
     report = {"source": str(a.input), "duration": duration, "segments": segments,
               "cuts": [{"start": c[0], "end": c[1], "reason": c[2]} for c in sorted(cuts)]}

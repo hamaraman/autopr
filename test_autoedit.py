@@ -79,4 +79,23 @@ with tempfile.TemporaryDirectory() as d:
     assert subprocess.run(cmd + ["--cuts", str(report), "-o", str(Path(d, "bad.mp4"))]).returncode != 0
     assert not Path(d, "bad.mp4").exists()
 
+    # 서로 떨어진 컷 6000개(필터 식 약 160KB): 명령줄 길이 제한에 걸리지 않는다
+    many = {"cuts": [{"start": i / 1000 + 0.0003, "end": i / 1000 + 0.0007} for i in range(6000)]}
+    report.write_text(json.dumps(many), encoding="utf-8")
+    subprocess.run(cmd + ["--cuts", str(report), "-o", str(Path(d, "many.mp4"))], check=True)
+    assert 1 < probe_duration(Path(d, "many.mp4")) <= 6.1
+
+    # 가변 프레임레이트 원본: 컷 뒤에도 영상과 소리 길이가 같다
+    vfr, vout = Path(d, "vfr.mkv"), Path(d, "vfr.cut.mkv")
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=d=8:r=30:s=320x240",
+         "-f", "lavfi", "-i", "sine=f=440:d=8", "-af", "volume='if(between(t,2,6),0,1)':eval=frame",
+         "-vf", "select='lt(mod(n,30),10)+not(mod(n,3))'", "-fps_mode", "vfr", "-pix_fmt", "yuv420p", str(vfr)],
+        check=True)
+    subprocess.run([sys.executable, cmd[1], str(vfr)], check=True)
+    lengths = [float(subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", s, "-show_entries", "packet=pts_time", "-of", "csv=p=0",
+         str(vout)], capture_output=True, text=True, check=True).stdout.split()[-1].strip(",")) for s in ("v:0", "a:0")]
+    assert abs(lengths[0] - lengths[1]) < 0.15, lengths
+
 print("OK")
