@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="ko">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>컷 검수</title>
+<!-- 브라우저에서 바로 여는 검수 화면. 파일은 이 컴퓨터 밖으로 나가지 않는다.
+     shortcut: 브라우저가 재생 못 하는 코덱(HEVC, ProRes)은 미리보기가 안 된다, 그런 원본이 생기면 프록시 생성 추가. -->
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, sans-serif; margin: 0 auto; padding: 16px; max-width: 1100px; }
+  h1 { font-size: 20px; margin: 0 0 8px; }
+  h2 { font-size: 16px; margin: 0 0 8px; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+  .player { position: sticky; top: 16px; }
+  video { width: 100%; background: #000; }
+  button, input { font: inherit; }
+  label { margin-right: 12px; }
+  ol { list-style: none; margin: 0; padding: 0; }
+  li { padding: 6px 8px; border-top: 1px solid color-mix(in srgb, currentColor 20%, transparent); }
+  li.cut { background: color-mix(in srgb, orange 18%, transparent); }
+  li.off, li.gone button { opacity: .55; }
+  li.gone button { text-decoration: line-through; }
+  li button.line { background: none; border: 0; padding: 0; text-align: left; color: inherit; cursor: pointer; }
+  input[type=number] { width: 6.5em; }
+  time { font-variant-numeric: tabular-nums; opacity: .7; margin-right: 8px; }
+  code { word-break: break-all; }
+</style>
+
+<h1>컷 검수</h1>
+<p>
+  <label>원본 영상 <input type="file" id="videoFile" accept="video/*"></label>
+  <label>컷 파일(.json) <input type="file" id="jsonFile" accept=".json,application/json"></label>
+</p>
+<main>
+  <section class="player">
+    <video id="video" controls></video>
+    <p><label><input type="checkbox" id="preview" checked> 재생할 때 컷 구간 건너뛰기</label></p>
+    <p>
+      <button id="add">현재 위치에 컷 추가</button>
+      <button id="save">고친 컷 파일 저장</button>
+    </p>
+    <p id="status" role="status"></p>
+  </section>
+  <section>
+    <h2>컷과 전사</h2>
+    <p>체크를 끄면 그 컷이 되살아납니다. 문장을 누르면 그 위치로 이동합니다.</p>
+    <ol id="rows"></ol>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const REASONS = { silence: "무음", filler: "추임새", ng: "다시 말함", manual: "직접 추가" };
+let data = null, cuts = [], jsonName = "cuts.json";
+
+// 재생 위치 t가 켜진 컷 안이면 그 컷의 끝을 돌려준다
+const skipTo = (t, cuts) => { const c = cuts.find(c => c.on && c.start <= t && t < c.end); return c ? c.end : null; };
+console.assert(skipTo(1, [{ start: 0, end: 2, on: true }]) === 2);
+console.assert(skipTo(1, [{ start: 0, end: 2, on: false }]) === null);
+console.assert(skipTo(2, [{ start: 0, end: 2, on: true }]) === null);
+
+const clock = t => `${Math.floor(t / 60)}:${(t % 60).toFixed(1).padStart(4, "0")}`;
+const el = (tag, props = {}, ...kids) => { const e = Object.assign(document.createElement(tag), props); e.append(...kids); return e; };
+
+function draw() {
+  const rows = [...cuts.map(c => ({ t: c.start, c })), ...(data.segments || []).map(s => ({ t: s.start, s }))];
+  rows.sort((a, b) => a.t - b.t);
+  $("rows").replaceChildren(...rows.map(({ c, s }) => {
+    if (s) {  // 전사 문장. textContent로만 넣는다 (파일 내용을 HTML로 해석하지 않음)
+      const gone = cuts.some(c => c.on && c.start <= s.start && s.end <= c.end);
+      return el("li", { className: gone ? "gone" : "" },
+        el("button", { className: "line", onclick: () => { $("video").currentTime = s.start; } },
+          el("time", {}, clock(s.start)), s.text));
+    }
+    const num = key => el("input", { type: "number", step: "0.01", min: "0", value: Math.round(c[key] * 100) / 100,
+      ariaLabel: key === "start" ? "컷 시작(초)" : "컷 끝(초)",
+      onchange: e => { c[key] = Number(e.target.value); draw(); } });
+    return el("li", { className: c.on ? "cut" : "cut off" },
+      el("label", {}, el("input", { type: "checkbox", checked: c.on, onchange: e => { c.on = e.target.checked; draw(); } }),
+        ` 컷 · ${REASONS[c.reason] || c.reason} `),
+      num("start"), " ~ ", num("end"), " 초 ",
+      el("button", { onclick: () => { $("video").currentTime = Math.max(0, c.start - 1.5); } }, "앞에서 재생"));
+  }));
+}
+
+$("videoFile").onchange = e => { if (e.target.files[0]) $("video").src = URL.createObjectURL(e.target.files[0]); };
+
+$("jsonFile").onchange = async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  try {
+    const d = JSON.parse(await file.text());
+    cuts = d.cuts.map(c => ({ start: Number(c.start), end: Number(c.end), reason: String(c.reason || "manual"), on: true }));
+    data = d; jsonName = file.name;
+    $("status").textContent = `컷 ${cuts.length}개를 불러왔습니다.`;
+    draw();
+  } catch (err) {
+    $("status").textContent = `컷 파일을 읽을 수 없습니다: ${err.message}`;
+  }
+};
+
+$("video").ontimeupdate = () => {
+  const to = $("preview").checked ? skipTo($("video").currentTime, cuts) : null;
+  if (to !== null) $("video").currentTime = to;
+};
+
+$("add").onclick = () => {
+  if (!data) return void ($("status").textContent = "먼저 컷 파일을 불러오세요.");
+  const t = Math.round($("video").currentTime * 100) / 100;
+  cuts.push({ start: t, end: Math.min(t + 1, data.duration), reason: "manual", on: true });
+  draw();
+};
+
+$("save").onclick = () => {
+  if (!data) return void ($("status").textContent = "먼저 컷 파일을 불러오세요.");
+  const live = cuts.filter(c => c.on).sort((a, b) => a.start - b.start);
+  const bad = live.find(c => !(0 <= c.start && c.start < c.end && c.end <= data.duration + 0.01));
+  if (bad) return void ($("status").textContent =
+    `컷 ${bad.start}~${bad.end}초가 잘못됐습니다. 시작은 끝보다 작고, 영상 길이(${data.duration.toFixed(2)}초) 안이어야 합니다.`);
+  const out = { ...data, cuts: live.map(({ start, end, reason }) => ({ start, end, reason })) };
+  const name = jsonName.replace(/\.json$/i, "") + ".reviewed.json";
+  el("a", { href: URL.createObjectURL(new Blob([JSON.stringify(out, null, 1)], { type: "application/json" })), download: name }).click();
+  $("status").replaceChildren(`${name} 저장됨. 다시 렌더링: `,
+    el("code", {}, `python3 autoedit.py "${data.source}" --cuts ${name} -o 최종.mp4`));
+};
+</script>
+</html>
