@@ -4,7 +4,7 @@
 사용: python3 autoedit.py 입력.mp4 [-o 출력.mp4] [--noise -35] [--min-silence 0.6]
       python3 autoedit.py 입력.mp4 --speech   # 추임새·반복 발화(NG)도 컷 + 자막(.srt) 저장
       python3 autoedit.py 입력.mp4 --edl      # 프리미어·리졸브용 컷 목록(.edl)도 저장
-검수: 결과와 함께 나오는 .json의 "cuts"를 고친 뒤 다시 렌더링한다
+검수: review.html을 브라우저로 열어 원본과 .json을 불러 컷을 고치고 저장한 뒤 다시 렌더링한다
       python3 autoedit.py 입력.mp4 --cuts 입력.cut.json -o 최종.mp4
 필요: ffmpeg, ffprobe (PATH). --speech는 추가로 pip install faster-whisper
 """
